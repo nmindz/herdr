@@ -142,6 +142,9 @@ fn clear_integration_path_env() {
     std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
     std::env::remove_var(GROK_CONFIG_DIR_ENV_VAR);
     std::env::remove_var(GROK_HOME_ENV_VAR);
+    // A real DSH_HOME in the developer's environment would point these tests at
+    // the live harness home instead of the fake HOME they build.
+    std::env::remove_var(DSH_HOME_ENV_VAR);
 }
 
 fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
@@ -2482,6 +2485,155 @@ fn install_kilo_errors_when_config_dir_missing() {
     let err = install_kilo().unwrap_err().to_string();
 
     assert!(err.contains("kilo config directory not found"));
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_dsh_writes_plugin_and_registers_the_home_patch_layer() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dsh_home = home.join(".dsh");
+    fs::create_dir_all(&dsh_home).unwrap();
+    std::env::set_var("HOME", &home);
+
+    let installed = install_dsh().unwrap();
+
+    assert_eq!(
+        installed.plugin_path,
+        dsh_home.join(DSH_PLUGIN_INSTALL_NAME)
+    );
+    assert_eq!(
+        fs::read_to_string(&installed.plugin_path).unwrap(),
+        DSH_PLUGIN_ASSET
+    );
+    assert_eq!(installed.patch_path, dsh_home.join(DSH_PATCH_INSTALL_NAME));
+    assert!(installed.updated_patch);
+    let patch = fs::read_to_string(&installed.patch_path).unwrap();
+    assert!(super::dsh_patch::plugin_is_configured(
+        &patch,
+        DSH_PLUGIN_ENTRY_ID,
+        DSH_PLUGIN_SPEC
+    ));
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_dsh_keeps_foreign_home_patch_entries() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dsh_home = home.join(".dsh");
+    fs::create_dir_all(&dsh_home).unwrap();
+    let foreign = "# >>> dsh-movein (generated block)\n- insert:\n    - id: mcp-other\n      name: '@vendor/other'\n# <<< dsh-movein\n";
+    fs::write(dsh_home.join(DSH_PATCH_INSTALL_NAME), foreign).unwrap();
+    std::env::set_var("HOME", &home);
+
+    let installed = install_dsh().unwrap();
+    let patch = fs::read_to_string(&installed.patch_path).unwrap();
+
+    assert!(patch.starts_with(foreign.trim_end()));
+    assert!(super::dsh_patch::plugin_is_configured(
+        &patch,
+        DSH_PLUGIN_ENTRY_ID,
+        DSH_PLUGIN_SPEC
+    ));
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn dsh_status_requires_the_home_patch_entry() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dsh_home = home.join(".dsh");
+    fs::create_dir_all(&dsh_home).unwrap();
+    std::env::set_var("HOME", &home);
+
+    let installed = install_dsh().unwrap();
+    let status = || {
+        integration_status_at(
+            crate::api::schema::IntegrationTarget::Dsh,
+            installed.plugin_path.clone(),
+            DSH_INTEGRATION_VERSION,
+        )
+        .state
+    };
+
+    assert_eq!(status(), IntegrationStatusKind::Current);
+    fs::write(&installed.patch_path, "[]\n").unwrap();
+    assert_eq!(status(), IntegrationStatusKind::Outdated);
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn uninstall_dsh_deregisters_before_removing_the_plugin() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dsh_home = home.join(".dsh");
+    fs::create_dir_all(&dsh_home).unwrap();
+    fs::write(dsh_home.join(DSH_PATCH_INSTALL_NAME), "# keep me\n[]\n").unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_dsh().unwrap();
+    let result = uninstall_dsh().unwrap();
+
+    assert!(result.removed_plugin);
+    assert!(result.updated_patch);
+    assert!(!result.removed_patch_file);
+    assert!(!result.plugin_path.exists());
+    // The patch file stays a valid YAML array, which DSH requires of any home
+    // layer it finds on disk.
+    assert_eq!(
+        fs::read_to_string(&result.patch_path).unwrap(),
+        "# keep me\n[]\n"
+    );
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn uninstall_dsh_removes_a_patch_file_it_created() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dsh_home = home.join(".dsh");
+    fs::create_dir_all(&dsh_home).unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_dsh().unwrap();
+    let result = uninstall_dsh().unwrap();
+
+    assert!(result.removed_patch_file);
+    assert!(!result.updated_patch);
+    assert!(!result.patch_path.exists());
+    assert!(!result.plugin_path.exists());
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_dsh_errors_when_the_harness_home_is_missing() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    fs::create_dir_all(&home).unwrap();
+    std::env::set_var("HOME", &home);
+
+    let err = install_dsh().unwrap_err().to_string();
+
+    assert!(err.contains("dsh home not found"));
 
     std::env::remove_var("HOME");
     let _ = fs::remove_dir_all(base);

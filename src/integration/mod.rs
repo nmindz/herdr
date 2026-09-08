@@ -2,6 +2,7 @@ mod actions;
 mod claude_settings;
 mod command;
 mod config_edit;
+mod dsh_patch;
 mod env;
 mod file_ops;
 mod opencode_config;
@@ -294,6 +295,17 @@ const GROK_HOOK_ASSET: &str = if cfg!(windows) {
     include_str!("assets/grok/herdr-agent-state.sh")
 };
 const GROK_INTEGRATION_VERSION: u32 = 1;
+/// DSH loads the plugin from a `file:` URL anchored beside the home patch
+/// layer, so the asset must be `.mjs`: `$DSH_HOME` carries no `package.json`
+/// and Node would otherwise read a `.js` file as CommonJS.
+const DSH_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.mjs";
+const DSH_PLUGIN_SPEC: &str = "./herdr-agent-state.mjs";
+const DSH_PLUGIN_ENTRY_ID: &str = "herdr-agent-state";
+const DSH_PLUGIN_ASSET: &str = include_str!("assets/dsh/herdr-agent-state.mjs");
+const DSH_PATCH_INSTALL_NAME: &str = "cordis.patch.yml";
+/// DSH did not exist in the latest release, so its migration version starts at
+/// one and stays there until a release ships it.
+const DSH_INTEGRATION_VERSION: u32 = 1;
 
 pub(crate) const INSTALL_WARNING_PREFIX: &str = "warning:";
 

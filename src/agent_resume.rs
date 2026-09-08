@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 const MAX_SESSION_ID_LEN: usize = 512;
 const MAX_SESSION_PATH_LEN: usize = 4096;
+const MAX_DSH_PROFILE_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionRef {
@@ -225,6 +226,16 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:grok", "grok", AgentSessionRefKind::Id) => {
             vec!["grok".into(), "--resume".into(), session_ref.value.clone()]
         }
+        ("herdr:dsh", "dsh", AgentSessionRefKind::Id) => {
+            let (profile, session_id) = dsh_profile_and_session(&session_ref.value)?;
+            vec![
+                "dsh".into(),
+                "--profile".into(),
+                profile.to_string(),
+                "--resume".into(),
+                session_id.to_string(),
+            ]
+        }
         _ => return None,
     };
 
@@ -233,6 +244,40 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         argv,
         dedupe_key: dedupe_key(source, agent, session_ref),
     })
+}
+
+/// Split a DSH session ref into the profile that booted it and its session id.
+///
+/// `dsh` refuses to boot without `--profile <name>`, and the profile is not
+/// recoverable from the session store, so the integration reports both as
+/// `<profile>/<session id>`. A ref without a profile comes from an embedder
+/// that booted no profile; there is no command to reconstruct, so it resumes
+/// nothing.
+///
+/// Both halves are validated rather than trusted: the value arrives from a
+/// plugin over the socket API and becomes process arguments.
+fn dsh_profile_and_session(value: &str) -> Option<(&str, &str)> {
+    // A DSH profile name can never contain a separator, so the first one ends
+    // the profile even if a session id somehow carried another.
+    let (profile, session_id) = value.split_once('/')?;
+    if !valid_dsh_profile(profile) || session_id.is_empty() || session_id.starts_with('-') {
+        return None;
+    }
+    Some((profile, session_id))
+}
+
+/// DSH's own profile-name rules, plus a leading-dash guard so a profile can
+/// never be mistaken for a flag.
+fn valid_dsh_profile(profile: &str) -> bool {
+    !profile.is_empty()
+        && profile.len() <= MAX_DSH_PROFILE_LEN
+        && !profile.starts_with('-')
+        && profile != "."
+        && profile != ".."
+        && profile != "node_modules"
+        && profile
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
 pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> String {
@@ -262,6 +307,8 @@ pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
             | ("herdr:cursor", "cursor")
             | ("herdr:antigravity_cli", "agy")
             | ("herdr:grok", "grok")
+            // DSH reports `<profile>/<session id>`; see `dsh_profile_and_session`.
+            | ("herdr:dsh", "dsh")
     )
 }
 
@@ -286,6 +333,68 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    fn dsh_plan_argv(value: &str) -> Option<Vec<String>> {
+        plan(
+            "herdr:dsh",
+            "dsh",
+            &AgentSessionRef::id(value).expect("session ref"),
+        )
+        .map(|plan| plan.argv)
+    }
+
+    #[test]
+    fn dsh_resume_reconstructs_the_profile_boot_command() {
+        assert_eq!(
+            dsh_plan_argv("tui/cc147281-69e5-46b3-a80a-31f3f3d9bf63").unwrap(),
+            vec![
+                "dsh",
+                "--profile",
+                "tui",
+                "--resume",
+                "cc147281-69e5-46b3-a80a-31f3f3d9bf63"
+            ]
+        );
+    }
+
+    #[test]
+    fn dsh_resume_needs_a_profile_because_dsh_refuses_to_boot_without_one() {
+        // An embedder that booted no profile reports the bare session id.
+        assert!(dsh_plan_argv("cc147281-69e5-46b3-a80a-31f3f3d9bf63").is_none());
+        assert!(dsh_plan_argv("/cc147281").is_none());
+        assert!(dsh_plan_argv("tui/").is_none());
+    }
+
+    #[test]
+    fn dsh_resume_rejects_profiles_that_could_forge_arguments_or_paths() {
+        for value in [
+            "--profile/session",
+            "-tui/session",
+            "../session",
+            "./session",
+            "node_modules/session",
+            "tui space/session",
+            "tui;rm -rf/session",
+            "tui\\win/session",
+        ] {
+            assert!(
+                dsh_plan_argv(value).is_none(),
+                "{value} must not produce a resume command"
+            );
+        }
+        assert!(dsh_plan_argv("tui/-x").is_none(), "session id as a flag");
+    }
+
+    #[test]
+    fn dsh_resume_keeps_profiles_apart_in_the_dedupe_key() {
+        let tui = AgentSessionRef::id("tui/session-1").unwrap();
+        let web = AgentSessionRef::id("web/session-1").unwrap();
+
+        assert_ne!(
+            dedupe_key("herdr:dsh", "dsh", &tui),
+            dedupe_key("herdr:dsh", "dsh", &web)
+        );
     }
 
     #[test]
