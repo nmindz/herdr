@@ -35,7 +35,6 @@ use super::{
         AgentOscStateTracker, DefaultColorEvent, DefaultColorEventTracker, DefaultColorOscTracker,
         DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker,
     },
-    xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
 
 const DEFAULT_DETECTION_ROWS: usize = 24;
@@ -205,7 +204,6 @@ pub(crate) struct GhosttyPaneCore {
     pub child_default_background_changed: bool,
     pub osc_debug_tracker: OscDebugTracker,
     pub agent_osc_state: AgentOscStateTracker,
-    pub xtgettcap_query_tracker: XtgettcapQueryTracker,
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
@@ -1158,7 +1156,6 @@ impl GhosttyPaneTerminal {
                 child_default_background_changed: false,
                 osc_debug_tracker: OscDebugTracker::default(),
                 agent_osc_state: AgentOscStateTracker::default(),
-                xtgettcap_query_tracker: XtgettcapQueryTracker::default(),
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
@@ -1384,19 +1381,15 @@ impl GhosttyPaneTerminal {
         let mut terminal_responses = Vec::new();
         core.default_color_event_tracker
             .observe(filtered_bytes.as_ref());
-        core.xtgettcap_query_tracker
-            .observe(filtered_bytes.as_ref());
         core.decscusr_tracker.observe(filtered_bytes.as_ref());
         let in_progress_default_color_event = core.default_color_event_tracker.in_progress_event();
         let default_color_events = core.default_color_event_tracker.drain_pending();
-        let xtgettcap_responses = core.xtgettcap_query_tracker.drain_pending();
         let write_started = crate::render_prof::timer();
         self.write_pty_bytes_with_ordered_responses(
             &mut core,
             filtered_bytes.as_ref(),
             default_color_events,
             in_progress_default_color_event,
-            xtgettcap_responses,
             &mut terminal_responses,
         );
         let terminal_bells = core.terminal.take_bell_count();
@@ -1470,20 +1463,12 @@ impl GhosttyPaneTerminal {
         bytes: &[u8],
         default_color_events: Vec<DefaultColorTrackedEvent>,
         in_progress_default_color_event: Option<DefaultColorEvent>,
-        xtgettcap_responses: Vec<XtgettcapResponse>,
         terminal_responses: &mut Vec<Bytes>,
     ) {
-        let mut events = Vec::with_capacity(default_color_events.len() + xtgettcap_responses.len());
-        events.extend(
-            default_color_events
-                .into_iter()
-                .map(OrderedPtyResponseEvent::DefaultColor),
-        );
-        events.extend(
-            xtgettcap_responses
-                .into_iter()
-                .map(OrderedPtyResponseEvent::Xtgettcap),
-        );
+        let mut events: Vec<OrderedPtyResponseEvent> = default_color_events
+            .into_iter()
+            .map(OrderedPtyResponseEvent::DefaultColor)
+            .collect();
         events.sort_by_key(OrderedPtyResponseEvent::end_offset);
 
         let mut written = 0;
@@ -1506,10 +1491,6 @@ impl GhosttyPaneTerminal {
                     }
                     terminal_responses.extend(libghostty_responses);
                     terminal_responses.extend(replacement);
-                }
-                OrderedPtyResponseEvent::Xtgettcap(response) => {
-                    terminal_responses.extend(libghostty_responses);
-                    terminal_responses.push(response.bytes);
                 }
             }
         }
@@ -3182,17 +3163,18 @@ fn ghostty_cell_style(
     style.add_modifier(modifiers)
 }
 
+/// A herdr-owned PTY reply that must be spliced into libghostty's output at a
+/// known byte offset. XTGETTCAP is no longer one of these: the vendored
+/// libghostty-vt answers those queries itself from ghostty's terminfo source.
 #[derive(Debug)]
 enum OrderedPtyResponseEvent {
     DefaultColor(DefaultColorTrackedEvent),
-    Xtgettcap(XtgettcapResponse),
 }
 
 impl OrderedPtyResponseEvent {
     fn end_offset(&self) -> usize {
         match self {
             Self::DefaultColor(event) => event.end_offset,
-            Self::Xtgettcap(response) => response.end_offset,
         }
     }
 }
@@ -5894,6 +5876,10 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// XTGETTCAP is answered by the vendored libghostty-vt from ghostty's own
+    /// terminfo source. herdr synthesizes nothing here; these tests pin that
+    /// those answers reach the pane exactly once and keep their order relative
+    /// to the replies herdr does own.
     #[test]
     fn process_pty_bytes_returns_xtgettcap_truecolor_query_responses_without_queuing_input() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -5920,6 +5906,9 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A query split across reads is answered exactly once. libghostty unhooks
+    /// the DCS on the ESC that opens ST, so the reply surfaces on the read
+    /// carrying that ESC rather than on the one carrying the final backslash.
     #[test]
     fn process_pty_bytes_returns_split_xtgettcap_query_response() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -5930,11 +5919,8 @@ mod tests {
         let result = pane.process_pty_bytes(pane_id, 0, b"\x1bP+q4", &tx);
         assert!(result.terminal_responses.is_empty());
         assert!(rx.try_recv().is_err());
-        let result = pane.process_pty_bytes(pane_id, 0, b"D73\x1b", &tx);
-        assert!(result.terminal_responses.is_empty());
-        assert!(rx.try_recv().is_err());
-        let result = pane.process_pty_bytes(pane_id, 0, b"\\", &tx);
 
+        let result = pane.process_pty_bytes(pane_id, 0, b"D73\x1b", &tx);
         assert_eq!(
             result.terminal_responses,
             vec![expected_xtgettcap_response(
@@ -5942,6 +5928,10 @@ mod tests {
                 Some(b"\\E]52;%p1%s;%p2%s\\007")
             )]
         );
+        assert!(rx.try_recv().is_err());
+
+        let result = pane.process_pty_bytes(pane_id, 0, b"\\", &tx);
+        assert!(result.terminal_responses.is_empty());
         assert!(rx.try_recv().is_err());
     }
 
