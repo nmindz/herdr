@@ -1026,6 +1026,17 @@ impl Terminal {
         install_png_decoder_once();
         let storage_limit = KITTY_IMAGE_STORAGE_LIMIT_BYTES;
         let enable_medium = true;
+        // The temporary-file medium is enabled by naming the directory its
+        // files must live in; libghostty-vt used to resolve that directory
+        // itself from a bool. It still allows /tmp and /dev/shm on its own and
+        // resolves this path through realpath, so naming the platform
+        // temporary directory keeps the same set of accepted files.
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = temp_dir.to_string_lossy();
+        let temp_dir_medium = ffi::GhosttyString {
+            ptr: temp_dir.as_ptr(),
+            len: temp_dir.len(),
+        };
         unsafe {
             ffi::ghostty_terminal_set(
                 self.raw,
@@ -1042,7 +1053,7 @@ impl Terminal {
             ffi::ghostty_terminal_set(
                 self.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
-                (&enable_medium as *const bool).cast(),
+                (&temp_dir_medium as *const ffi::GhosttyString).cast(),
             )
             .into_result()?;
             ffi::ghostty_terminal_set(
@@ -3552,6 +3563,66 @@ mod tests {
         );
     }
 
+    /// Every terminal option herdr sets must be accepted. These are passed as
+    /// `*const c_void`, so a changed input type in the vendored library cannot
+    /// fail to compile; only calling it can catch that. `enable_kitty_graphics`
+    /// is the whole reason: the temporary-file medium moved from `bool` to a
+    /// directory string, and passing the old bool made the library read a
+    /// garbage length and reject the option.
+    #[test]
+    fn enable_kitty_graphics_accepts_every_option_it_sets() {
+        let mut terminal = Terminal::new(120, 40, 10_000_000).unwrap();
+        terminal
+            .enable_kitty_graphics()
+            .expect("every kitty option must be accepted");
+    }
+
+    /// A temporary-file transmission is accepted from the directory herdr
+    /// names, and the medium is genuinely on rather than silently disabled.
+    #[test]
+    fn kitty_temporary_file_medium_loads_from_the_platform_temp_dir() {
+        use std::io::Write;
+
+        let mut terminal = Terminal::new(20, 5, 0).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+
+        // The protocol requires the name to carry this marker, and the library
+        // deletes the file after reading it.
+        let path = std::env::temp_dir().join(format!(
+            "tty-graphics-protocol-herdr-{}-{}.data",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        // One opaque RGB pixel.
+        file.write_all(&[0xff, 0x00, 0x00]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let encoded = base64_encode_for_test(path.to_string_lossy().as_bytes());
+        terminal.write(
+            format!("\x1b_Ga=T,f=24,t=t,i=77,s=1,v=1,c=1,r=1,q=2;{encoded}\x1b\\").as_bytes(),
+        );
+
+        let placements = terminal
+            .kitty_image_placements_with_data_filter(|_| true)
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            placements.len(),
+            1,
+            "temporary-file transmission from the named directory must load"
+        );
+    }
+
+    fn base64_encode_for_test(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
     #[test]
     fn kitty_storage_generation_skips_only_proven_empty_storage() {
         let mut terminal = Terminal::new(10, 5, 1_000_000).unwrap();
@@ -3656,11 +3727,27 @@ mod tests {
             .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE)
             .unwrap());
         assert!(terminal
-            .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_TEMP_FILE)
-            .unwrap());
-        assert!(terminal
             .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_SHARED_MEM)
             .unwrap());
+
+        // The temporary-file medium reports the directory it is restricted to
+        // rather than a flag, so a non-empty answer is what proves it is on.
+        let mut reported = ffi::GhosttyString::default();
+        unsafe {
+            ffi::ghostty_terminal_get(
+                terminal.raw,
+                ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_TEMP_FILE,
+                (&mut reported as *mut ffi::GhosttyString).cast(),
+            )
+            .into_result()
+            .unwrap();
+        }
+        let reported = unsafe { borrowed_bytes(reported) }.unwrap_or_default();
+        assert_eq!(
+            reported,
+            std::env::temp_dir().to_string_lossy().as_bytes(),
+            "the temporary-file medium must be restricted to the platform temp dir"
+        );
     }
 
     #[test]
