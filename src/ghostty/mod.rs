@@ -146,12 +146,12 @@ pub const MOD_CTRL: u16 = ffi::GHOSTTY_MODS_CTRL as u16;
 pub const MOD_ALT: u16 = ffi::GHOSTTY_MODS_ALT as u16;
 pub const MOD_SUPER: u16 = ffi::GHOSTTY_MODS_SUPER as u16;
 
-pub const KEY_ENTER: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ENTER;
-pub const KEY_UP: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP;
-pub const KEY_DOWN: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN;
-pub const KEY_LEFT: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_LEFT;
-pub const KEY_RIGHT: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_RIGHT;
-pub const KEY_A: u32 = ffi::GhosttyKey_GHOSTTY_KEY_A;
+pub const KEY_ENTER: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ENTER;
+pub const KEY_UP: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP;
+pub const KEY_DOWN: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN;
+pub const KEY_LEFT: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_LEFT;
+pub const KEY_RIGHT: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_RIGHT;
+pub const KEY_A: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_A;
 
 pub const MOUSE_ACTION_PRESS: ffi::GhosttyMouseAction =
     ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS;
@@ -553,16 +553,52 @@ unsafe extern "C" fn write_pty_trampoline(
     callback(bytes);
 }
 
+/// Answer a clipboard write request.
+///
+/// The decision is delivered by calling the request's own `reply` function
+/// before returning. Returning without replying denies the write, so the reply
+/// is not optional on any path.
 unsafe extern "C" fn clipboard_write_trampoline(
     _terminal: ffi::GhosttyTerminal,
     userdata: *mut c_void,
     write: *const ffi::GhosttyClipboardWrite,
-) -> ffi::GhosttyClipboardWriteResult {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: libghostty-vt owns these values for the synchronous callback.
         unsafe { capture_clipboard_write(userdata, write) }
     }))
-    .unwrap_or(ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA)
+    .unwrap_or(ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA);
+    // SAFETY: the request outlives this call, and the size field gates the
+    // reply field just as capture_clipboard_write gates what it reads.
+    unsafe { reply_to_clipboard_write(write, result) };
+}
+
+unsafe fn reply_to_clipboard_write(
+    write: *const ffi::GhosttyClipboardWrite,
+    result: ffi::GhosttyClipboardWriteResult,
+) {
+    if write.is_null() {
+        return;
+    }
+    let required_size = std::mem::offset_of!(ffi::GhosttyClipboardWrite, reply)
+        + std::mem::size_of::<ffi::GhosttyClipboardWriteReplyFn>();
+    // SAFETY: size is the leading field of the live request.
+    if unsafe { (*write).size } < required_size {
+        return;
+    }
+    // SAFETY: the size check above covers the reply field.
+    let Some(reply) = (unsafe { (*write).reply }) else {
+        return;
+    };
+    let answer = ffi::GhosttyClipboardWriteReply {
+        size: std::mem::size_of::<ffi::GhosttyClipboardWriteReply>(),
+        result,
+        // Herdr writes the pane's clipboard without a permission prompt, so
+        // there is no decision to remember.
+        remember: false,
+    };
+    // SAFETY: both the request and the reply live through this call.
+    unsafe { reply(write, &answer) };
 }
 
 unsafe fn capture_clipboard_write(
@@ -798,14 +834,22 @@ pub struct Terminal {
 impl Terminal {
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, Error> {
         let mut raw = ptr::null_mut();
-        let options = ffi::GhosttyTerminalOptions {
-            cols,
-            rows,
-            max_scrollback,
-        };
-        // SAFETY: valid out pointer and options, null allocator means default allocator.
+        // SAFETY: valid out pointer, null allocator means default allocator.
         unsafe {
-            ffi::ghostty_terminal_new(ptr::null(), &mut raw, options).into_result()?;
+            ffi::ghostty_terminal_new(ptr::null(), &mut raw, cols, rows).into_result()?;
+        }
+        // Scrollback is no longer a creation option. It is set before the
+        // terminal parses anything, so the limit still applies from the start.
+        // The budget is bytes, matching the retired creation option; the line
+        // limit is a separate option herdr does not set.
+        // SAFETY: the option reads a borrowed size_t.
+        unsafe {
+            ffi::ghostty_terminal_set(
+                raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+                (&max_scrollback as *const usize).cast(),
+            )
+            .into_result()?;
         }
 
         let mut terminal = Self {
@@ -870,6 +914,10 @@ impl Terminal {
             )
             .into_result()?;
         }
+        // Herdr reads cells directly, so a multi-codepoint grapheme cluster
+        // must occupy one cell. Setting the reset default keeps clustering
+        // active after the pane's program issues a full reset.
+        terminal.mode_set_default(MODE_GRAPHEME_CLUSTER, true)?;
         Ok(terminal)
     }
 
@@ -1052,13 +1100,57 @@ impl Terminal {
     }
 
     pub fn mode_get(&self, mode: u16) -> Result<bool, Error> {
-        let mut out = false;
-        unsafe { ffi::ghostty_terminal_mode_get(self.raw, mode, &mut out).into_result()? };
-        Ok(out)
+        let mut config = ffi::GhosttyTerminalModeConfig { mode, value: false };
+        // SAFETY: the mode field is initialized and the out pointer matches the
+        // config type this data kind reads and writes.
+        unsafe {
+            ffi::ghostty_terminal_get(
+                self.raw,
+                ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MODE,
+                (&mut config as *mut ffi::GhosttyTerminalModeConfig).cast(),
+            )
+            .into_result()?;
+        }
+        Ok(config.value)
     }
 
     pub fn mode_set(&mut self, mode: u16, value: bool) -> Result<(), Error> {
-        unsafe { ffi::ghostty_terminal_mode_set(self.raw, mode, value).into_result() }
+        self.set_mode_option(
+            ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_MODE,
+            mode,
+            value,
+        )
+    }
+
+    /// Set a mode and the value a full reset (RIS) restores.
+    ///
+    /// Herdr renders cells directly and needs DEC mode 2027 to keep a
+    /// multi-codepoint grapheme cluster in one cell, including after the
+    /// program in the pane issues `ESC c`.
+    pub fn mode_set_default(&mut self, mode: u16, value: bool) -> Result<(), Error> {
+        self.set_mode_option(
+            ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_MODE_DEFAULT,
+            mode,
+            value,
+        )
+    }
+
+    fn set_mode_option(
+        &mut self,
+        option: ffi::GhosttyTerminalOption,
+        mode: u16,
+        value: bool,
+    ) -> Result<(), Error> {
+        let config = ffi::GhosttyTerminalModeConfig { mode, value };
+        // SAFETY: both mode options read a borrowed config of this type.
+        unsafe {
+            ffi::ghostty_terminal_set(
+                self.raw,
+                option,
+                (&config as *const ffi::GhosttyTerminalModeConfig).cast(),
+            )
+            .into_result()
+        }
     }
 
     pub fn kitty_keyboard_flags(&self) -> Result<u8, Error> {
@@ -2538,8 +2630,15 @@ impl RenderState {
             size: mem::size_of::<ffi::GhosttyRenderStateColors>(),
             ..Default::default()
         };
+        // SAFETY: colors carries its own size and matches the type this data
+        // kind writes.
         unsafe {
-            ffi::ghostty_render_state_colors_get(self.raw, &mut colors).into_result()?;
+            ffi::ghostty_render_state_get(
+                self.raw,
+                ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_COLORS,
+                (&mut colors as *mut ffi::GhosttyRenderStateColors).cast(),
+            )
+            .into_result()?;
         }
         Ok(RenderColors {
             background: colors.background.into(),
@@ -2627,7 +2726,7 @@ impl KeyEvent {
         unsafe { ffi::ghostty_key_event_set_action(self.raw, action) }
     }
 
-    pub fn set_key(&mut self, key: u32) {
+    pub fn set_key(&mut self, key: ffi::GhosttyKey) {
         unsafe { ffi::ghostty_key_event_set_key(self.raw, key) }
     }
 
@@ -4072,12 +4171,20 @@ mod tests {
         terminal: &mut Terminal,
         contents: &[ffi::GhosttyClipboardContent],
         size: usize,
-    ) -> ffi::GhosttyClipboardWriteResult {
+    ) -> Option<ffi::GhosttyClipboardWriteResult> {
+        // The trampoline now answers through the request's reply function, so
+        // the fake request captures the result the way libghostty-vt would.
+        CAPTURED_REPLY.with(|captured| captured.set(None));
         let request = ffi::GhosttyClipboardWrite {
             size,
             location: ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
             contents: contents.as_ptr(),
             contents_len: contents.len(),
+            name: ffi::GhosttyString::default(),
+            granted: false,
+            can_remember: false,
+            ctx: ptr::null(),
+            reply: Some(capture_reply),
         };
         // SAFETY: the request and its borrowed content live through this call.
         unsafe {
@@ -4085,8 +4192,23 @@ mod tests {
                 terminal.raw,
                 (&mut *terminal.callback_state as *mut TerminalCallbackState).cast(),
                 &request,
-            )
+            );
         }
+        CAPTURED_REPLY.with(Cell::get)
+    }
+
+    thread_local! {
+        static CAPTURED_REPLY: Cell<Option<ffi::GhosttyClipboardWriteResult>> =
+            const { Cell::new(None) };
+    }
+
+    unsafe extern "C" fn capture_reply(
+        _write: *const ffi::GhosttyClipboardWrite,
+        reply: *const ffi::GhosttyClipboardWriteReply,
+    ) {
+        // SAFETY: the trampoline passes a live reply for the duration of the call.
+        let result = unsafe { (*reply).result };
+        CAPTURED_REPLY.with(|captured| captured.set(Some(result)));
     }
 
     #[test]
@@ -4100,31 +4222,35 @@ mod tests {
 
         assert_eq!(
             invoke_clipboard_callback(&mut terminal, &[], full_size),
-            success
+            Some(success)
         );
         assert!(terminal.take_clipboard_writes().is_empty());
 
         let empty = test_clipboard_content(b"text/plain", b"");
         assert_eq!(
             invoke_clipboard_callback(&mut terminal, &[empty], full_size),
-            unsupported
+            Some(unsupported)
         );
         let text = test_clipboard_content(b"text/plain", b"text");
         let image = test_clipboard_content(b"image/png", b"image");
         assert_eq!(
             invoke_clipboard_callback(&mut terminal, &[text, image], full_size),
-            unsupported
+            Some(unsupported)
         );
 
         let oversized = vec![b'x'; MAX_CLIPBOARD_BYTES + 1];
         let oversized = test_clipboard_content(b"text/plain", &oversized);
         assert_eq!(
             invoke_clipboard_callback(&mut terminal, &[oversized], full_size),
-            invalid
+            Some(invalid)
         );
+        // A request too small to carry the fields herdr reads is refused. It is
+        // also too small to carry a reply function, and upstream treats that
+        // reply-less return as a denied write.
+        let undersized = std::mem::offset_of!(ffi::GhosttyClipboardWrite, contents_len);
         assert_eq!(
-            invoke_clipboard_callback(&mut terminal, &[text], full_size - 1),
-            invalid
+            invoke_clipboard_callback(&mut terminal, &[text], undersized),
+            None
         );
         assert!(terminal.take_clipboard_writes().is_empty());
     }
