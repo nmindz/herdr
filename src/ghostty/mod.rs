@@ -3563,6 +3563,34 @@ mod tests {
         );
     }
 
+    /// C1 controls that arrive UTF-8 encoded (U+0080-U+009F) are ignored:
+    /// neither printed as glyphs nor executed. The vendored libghostty-vt
+    /// stores nothing for them, matching xterm. An earlier vendored snapshot
+    /// stored them as printable text, so this is pinned rather than assumed.
+    #[test]
+    fn utf8_encoded_c1_controls_are_ignored_rather_than_printed() {
+        let mut terminal = Terminal::new(20, 5, 0).unwrap();
+        // U+0084 (IND) and U+0085 (NEL) between printable letters.
+        terminal.write("\x1b[2J\x1b[1;1HA\u{84}B\u{85}C".as_bytes());
+
+        let rows = terminal.screen_text_rows().unwrap();
+        let printed: Vec<u32> = rows
+            .first()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .flat_map(|cell| cell.graphemes.iter().copied())
+                    .filter(|cp| *cp != u32::from(' '))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            printed,
+            vec![u32::from('A'), u32::from('B'), u32::from('C')],
+            "UTF-8-encoded C1 controls must leave no glyph behind"
+        );
+    }
+
     /// Every terminal option herdr sets must be accepted. These are passed as
     /// `*const c_void`, so a changed input type in the vendored library cannot
     /// fail to compile; only calling it can catch that. `enable_kitty_graphics`
