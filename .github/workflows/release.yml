@@ -99,7 +99,7 @@ jobs:
         if: runner.os != 'macOS'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Restore Homebrew Zig cache
         if: runner.os == 'macOS'
@@ -113,9 +113,9 @@ jobs:
       - name: Install patched Zig on macOS
         if: runner.os == 'macOS'
         run: |
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install zig@0.15
-          echo "$(brew --prefix zig@0.15)/bin" >> "$GITHUB_PATH"
-          "$(brew --prefix zig@0.15)/bin/zig" version
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install zig
+          echo "$(brew --prefix zig)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix zig)/bin/zig" version
 
       - name: Prefer official Ubuntu mirrors over Azure
         if: runner.os == 'Linux'
