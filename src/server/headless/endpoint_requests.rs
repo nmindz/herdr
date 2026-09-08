@@ -100,9 +100,8 @@ impl HeadlessServer {
         }
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.shell_endpoint_command_in_flight = true;
-            // A later source restore has a new projection revision. Keep this request's lease
-            // so a delayed worktree response cannot focus a pane after endpoint switching.
-            client.shell_endpoint_command_surface_revision = Some(client.shell_projection_revision);
+            // Snapshot updates must not revoke navigation, but a later surface activation must.
+            client.shell_endpoint_command_surface_epoch = Some(client.shell_surface_epoch);
             let deferred_worktree = matches!(
                 &request.method,
                 api::schema::Method::WorktreeCreate(_) | api::schema::Method::WorktreeRemove(_)

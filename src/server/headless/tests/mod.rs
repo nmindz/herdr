@@ -1360,17 +1360,14 @@ async fn client_shell_tab_focus_changes_only_the_source_connection() {
 #[tokio::test]
 async fn deferred_worktree_response_moves_only_its_source_client() {
     let mut server = test_headless_server();
-    let mut workspace = crate::workspace::Workspace::test_new("deferred-worktree");
-    let created_tab = workspace.test_add_tab(Some("created"));
+    let workspace = crate::workspace::Workspace::test_new("deferred-worktree");
     server.app.state.workspaces = vec![workspace];
     server.app.state.ensure_test_terminals();
     server.app.state.active = Some(0);
     server.app.state.selected = 0;
     server.app.state.mode = crate::app::Mode::Terminal;
-    let created_tab_id = server.app.public_tab_id(0, created_tab).unwrap();
-
-    let (source_control, _) = connect_matching_test_shell(&mut server, 51);
-    let (other_control, _) = connect_matching_test_shell(&mut server, 52);
+    let (source_control, _source_render) = connect_matching_test_shell(&mut server, 51);
+    let (other_control, _other_render) = connect_matching_test_shell(&mut server, 52);
     let _ = source_control.recv().expect("source snapshot");
     let _ = other_control.recv().expect("other snapshot");
     let original_tab_id = server.shell_tab_id_for_client(51).unwrap();
@@ -1379,17 +1376,34 @@ async fn deferred_worktree_response_moves_only_its_source_client() {
         .get_mut(&51)
         .unwrap()
         .shell_endpoint_command_in_flight = true;
-    let source_surface_revision = server.clients[&51].shell_projection_revision;
+    let source_projection_revision = server.clients[&51].shell_projection_revision;
+    let source_surface_epoch = server.clients[&51].shell_surface_epoch;
     server
         .clients
         .get_mut(&51)
         .unwrap()
-        .shell_endpoint_command_surface_revision = Some(source_surface_revision);
+        .shell_endpoint_command_surface_epoch = Some(source_surface_epoch);
     server
         .clients
         .get_mut(&51)
         .unwrap()
         .shell_deferred_navigation_response = Some(Vec::new());
+
+    // The new workspace can be published before its asynchronous response arrives.
+    server
+        .app
+        .state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("created-worktree"));
+    server.app.state.ensure_test_terminals();
+    let created_tab_id = server.app.public_tab_id(1, 0).unwrap();
+    server.render_and_stream();
+    assert!(server.clients[&51].shell_projection_revision > source_projection_revision);
+    assert_eq!(
+        server.shell_tab_id_for_client(51).as_deref(),
+        Some(original_tab_id.as_str())
+    );
+
     let response = serde_json::json!({
         "id": "create-worktree",
         "result": {
@@ -1419,44 +1433,44 @@ async fn deferred_worktree_response_moves_only_its_source_client() {
     );
 
     assert!(server.focus_shell_client_on_tab(51, &original_tab_id));
-    // A source command begun in the old presentation epoch may finish after source-off and
-    // source-on rollback. Its response remains endpoint-local, but it must not apply deferred
-    // client navigation to the restored source.
-    assert!(server.set_client_shell_surface_active(51, false).is_some());
-    assert!(server.set_client_shell_surface_active(51, true).is_some());
-    server
-        .clients
-        .get_mut(&51)
-        .unwrap()
-        .shell_endpoint_command_in_flight = true;
-    server
-        .clients
-        .get_mut(&51)
-        .unwrap()
-        .shell_endpoint_command_surface_revision = Some(source_surface_revision);
-    server
-        .clients
-        .get_mut(&51)
-        .unwrap()
-        .shell_deferred_navigation_request_id = Some("background-worktree".into());
-    server
-        .clients
-        .get_mut(&51)
-        .unwrap()
-        .shell_deferred_navigation_response = Some(Vec::new());
-    assert!(
-        !server.handle_server_event(ServerEvent::ClientShellEndpointResponseChunkReady {
-            client_id: 51,
-            boot_id: server.client_shell_boot_id.clone(),
-            request_id: "background-worktree".into(),
-            final_chunk: true,
-            data: serde_json::to_vec(&response).unwrap(),
-        })
-    );
-    assert_eq!(
-        server.shell_tab_id_for_client(51).as_deref(),
-        Some(original_tab_id.as_str())
-    );
+    // Switching away, switching back, and renewing activation all revoke old navigation.
+    for activations in [&[false][..], &[false, true], &[true]] {
+        assert!(server.set_client_shell_surface_active(51, true).is_some());
+        let client = server.clients.get_mut(&51).unwrap();
+        client.shell_endpoint_command_in_flight = true;
+        client.shell_endpoint_command_surface_epoch = Some(client.shell_surface_epoch);
+        client.shell_deferred_navigation_request_id = Some("background-worktree".into());
+        client.shell_deferred_navigation_response = Some(Vec::new());
+        for &active in activations {
+            assert!(server.set_client_shell_surface_active(51, active).is_some());
+        }
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientShellEndpointResponseChunkReady {
+                client_id: 51,
+                boot_id: server.client_shell_boot_id.clone(),
+                request_id: "background-worktree".into(),
+                final_chunk: true,
+                data: serde_json::to_vec(&response).unwrap(),
+            })
+        );
+        assert_eq!(
+            server.shell_tab_id_for_client(51).as_deref(),
+            Some(original_tab_id.as_str())
+        );
+        assert!(!server.clients[&51].shell_endpoint_command_in_flight);
+        loop {
+            let message = source_control
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("response must still reach the source client");
+            if matches!(
+                read_server_message(message),
+                ServerMessage::ClientShellEndpointResponseChunk { request_id, final_chunk: true, .. }
+                    if request_id == "background-worktree"
+            ) {
+                break;
+            }
+        }
+    }
     shutdown_test_runtimes(&mut server);
 }
 

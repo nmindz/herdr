@@ -179,11 +179,12 @@ pub(crate) struct ClientConnection {
     pub(crate) shell_snapshot: Option<crate::protocol::ClientShellSnapshot>,
     /// Monotonic shell replacement revision for this connection.
     pub(crate) shell_projection_revision: u64,
+    /// Surface activation epoch, independent of ordinary shell snapshot revisions.
+    pub(crate) shell_surface_epoch: u64,
     /// Whether this shell is waiting for one ordered endpoint command response.
     pub(crate) shell_endpoint_command_in_flight: bool,
-    /// Surface projection epoch that owned the in-flight command. Deferred navigation may run
-    /// only if this exact presentation lease is still active when its response arrives.
-    pub(crate) shell_endpoint_command_surface_revision: Option<u64>,
+    /// Activation epoch that must still own the surface when deferred navigation completes.
+    pub(crate) shell_endpoint_command_surface_epoch: Option<u64>,
     /// Request id and buffered response for a deferred worktree-created navigation.
     pub(crate) shell_deferred_navigation_request_id: Option<String>,
     pub(crate) shell_deferred_navigation_response: Option<Vec<u8>>,
@@ -245,8 +246,9 @@ impl ClientConnection {
             shell_location: None,
             shell_snapshot: None,
             shell_projection_revision: 0,
+            shell_surface_epoch: 0,
             shell_endpoint_command_in_flight: false,
-            shell_endpoint_command_surface_revision: None,
+            shell_endpoint_command_surface_epoch: None,
             shell_deferred_navigation_request_id: None,
             shell_deferred_navigation_response: None,
             shell_uses_endpoint_keybindings: false,
