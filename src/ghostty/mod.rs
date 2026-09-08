@@ -3512,8 +3512,15 @@ mod tests {
             .generation;
         assert_ne!(first_generation, 0);
 
-        // Same id and size, different pixels.
+        // Same id and size, different pixels. Retransmitting an id replaces the
+        // image and drops its placements, as the Kitty protocol requires, so the
+        // program has to place it again before it is visible.
         terminal.write(b"\x1b_Ga=t,f=32,t=d,i=7,s=1,v=1,q=2;AAAAAA==\x1b\\");
+        assert!(terminal
+            .kitty_image_placements_with_data_filter(|_| true)
+            .unwrap()
+            .is_empty());
+        terminal.write(b"\x1b_Ga=p,i=7,p=3,c=10,r=5,q=2;\x1b\\");
         let second = terminal
             .kitty_image_placements_with_data_filter(|_| true)
             .unwrap();
@@ -3585,7 +3592,16 @@ mod tests {
         terminal.scroll_viewport_row(0);
         assert_eq!(terminal.kitty_image_placements().unwrap().len(), 1);
 
+        // `d=A` deletes only placements visible in the active area, which the
+        // Kitty protocol requires and this one no longer is, so it must leave
+        // both the placement and the generation alone.
         terminal.write(b"\x1b_Ga=d,d=A\x1b\\");
+        assert_eq!(terminal.kitty_graphics_generation().unwrap(), placed);
+        terminal.scroll_viewport_row(0);
+        assert_eq!(terminal.kitty_image_placements().unwrap().len(), 1);
+
+        // Deleting by image id is not scoped to the active area.
+        terminal.write(b"\x1b_Ga=d,d=I,i=1\x1b\\");
         let deleted = terminal.kitty_graphics_generation().unwrap();
         assert_ne!(deleted, placed);
         assert!(terminal.kitty_graphics_may_have_placements().unwrap());

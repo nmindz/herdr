@@ -221,11 +221,19 @@ async fn retained_unicode_image_arrives_after_fragmented_upload_without_reupload
     };
     assert_eq!(surface.graphics.placements.len(), 1);
     assert_eq!(surface.graphics.assets[0].data, [255, 0, 0, 255]);
-    // Replacing pixels under the same image ID must invalidate the delivered asset.
+    // Replacing pixels under the same image ID must invalidate the delivered
+    // asset. Retransmitting an ID also drops that image's placements, virtual
+    // ones included, as the Kitty protocol requires, so the virtual placement
+    // is re-created before the placeholder cells can resolve again.
     write_shared_test_pane(
         &mut server,
         pane_id,
         b"\x1b_Ga=t,f=32,t=d,i=1193046,s=1,v=1,q=2;AP8A/w==\x1b\\",
+    );
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b_Ga=p,U=1,i=1193046,c=1,r=1,q=2\x1b\\",
     );
     assert!(server.render_retained_pane_surface_and_stream(&sources));
     let ServerMessage::PaneSurface(replaced) =
