@@ -93,6 +93,7 @@ function fakeContext(
     agents?: FakeAgent[];
     roots?: Array<{ id: string }>;
     projections?: Record<string, unknown>;
+    settings?: Record<string, unknown>;
   } = {},
 ) {
   const handlers = new Map<string, (...args: unknown[]) => void>();
@@ -100,6 +101,10 @@ function fakeContext(
   const services: Record<string, unknown> = {};
   if (options.projections !== undefined) {
     services.sessionProjections = { snapshot: () => ({ values: options.projections }) };
+  }
+  if (options.settings !== undefined) {
+    const sections = options.settings;
+    services.settings = { get: (ns: string) => sections[ns] };
   }
 
   const ctx = {
@@ -119,11 +124,13 @@ function fakeContext(
 
   // Cordis throws for a service the plugin never declared in `inject`, so the
   // asset must reach every optional service through `ctx.get`.
-  Object.defineProperty(ctx, "sessionProjections", {
-    get() {
-      throw new Error('cannot get property "sessionProjections" without inject');
-    },
-  });
+  for (const service of ["sessionProjections", "settings"]) {
+    Object.defineProperty(ctx, service, {
+      get() {
+        throw new Error(`cannot get property "${service}" without inject`);
+      },
+    });
+  }
 
   return {
     ctx,
@@ -360,9 +367,10 @@ test("seeds unresolved approvals from session snapshot events", async () => {
 test("reports display tokens on the display source", async () => {
   const { apply } = await loadAsset();
   const host = fakeContext({
+    settings: { "llm-pi-ai": { providers: { anthropic: { baseURL: "http://127.0.0.1:41090" } } } },
     projections: {
       title: "session title",
-      modelSelection: { next: { model: "m1", reasoningEffort: "high" } },
+      modelSelection: { next: { provider: "anthropic", model: "m1", reasoningEffort: "high" } },
       tokenUsage: { outputTokens: 1500 },
       contextPressure: { projectedTokens: 500_000, contextWindow: 1_000_000 },
     },
@@ -386,8 +394,59 @@ test("reports display tokens on the display source", async () => {
     dsh_title: "session title",
     limit: "\u03a3 2k",
     dsh_limit: "\u03a3 2k",
+    provider: "local",
+    dsh_provider: "local",
     dsh_model: "m1 \u00b7 high",
   });
+});
+
+// The provider cell names the backend actually serving the route, so a pane
+// behind a local proxy reads the same as every other agent's.
+test("names the routed backend from its configured base url", async () => {
+  const cases: Array<[string | undefined, string]> = [
+    ["http://127.0.0.1:41090", "local"],
+    ["http://localhost:11434", "ollama"],
+    ["https://api.deepseek.com/v1", "deepseek"],
+    ["https://api.anthropic.com", "anthropic"],
+    [undefined, "anthropic"],
+  ];
+
+  for (const [baseURL, expected] of cases) {
+    requests.length = 0;
+    const { apply } = await loadAsset();
+    const host = fakeContext({
+      settings: {
+        "llm-pi-ai": { providers: { anthropic: baseURL === undefined ? {} : { baseURL } } },
+      },
+      projections: { modelSelection: { next: { provider: "anthropic", model: "m1" } } },
+    });
+
+    apply(host.ctx);
+    await settle();
+    host.emit("session/event", { id: "s1" }, { type: "session/started" });
+    await settle();
+
+    const metadata = methodRequests("pane.report_metadata");
+    const tokens = requestParam(metadata[metadata.length - 1], "tokens") as Record<string, string>;
+    expect(tokens.provider).toBe(expected);
+    expect(tokens.dsh_provider).toBe(expected);
+  }
+});
+
+test("keeps the rollup when no projection service is loaded", async () => {
+  const { apply } = await loadAsset();
+  const host = fakeContext();
+
+  apply(host.ctx);
+  await settle();
+  host.emit("session/event", { id: "s1" }, { type: "session/started" });
+  await settle();
+
+  const metadata = methodRequests("pane.report_metadata");
+  const tokens = requestParam(metadata[metadata.length - 1], "tokens") as Record<string, string>;
+  expect(tokens.context).toBe("idle");
+  expect(tokens.provider).toBeUndefined();
+  expect(tokens.limit).toBeUndefined();
 });
 
 test("releases the pane when the effect disposer runs", async () => {
