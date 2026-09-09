@@ -87,6 +87,7 @@ integration-assets-test:
     bun test src/integration/assets/herdr-agent-state.test.ts
     bun test src/integration/assets/opencode/herdr-agent-state.test.ts
     bun test src/integration/assets/opencode/herdr-tui-session.test.ts
+    bun test src/integration/assets/dsh/herdr-agent-state.test.ts
 
 # Build the vendored libghostty-vt source dist
 build-libghostty-vt:

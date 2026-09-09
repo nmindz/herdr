@@ -52,6 +52,22 @@ pub(crate) struct KiloInstallPaths {
 }
 
 #[derive(Debug)]
+pub(crate) struct DshInstallPaths {
+    pub plugin_path: PathBuf,
+    pub patch_path: PathBuf,
+    pub updated_patch: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct DshUninstallResult {
+    pub plugin_path: PathBuf,
+    pub patch_path: PathBuf,
+    pub removed_plugin: bool,
+    pub updated_patch: bool,
+    pub removed_patch_file: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct OmpInstallPaths {
     pub extension_path: PathBuf,
     pub removed_legacy_pi_extension: bool,

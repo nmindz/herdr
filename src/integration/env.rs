@@ -24,6 +24,9 @@ pub(crate) const GROK_CONFIG_DIR_ENV_VAR: &str = "GROK_CONFIG_DIR";
 /// `$GROK_HOME/config.toml` and `$GROK_HOME/auth.json`).
 pub(crate) const GROK_HOME_ENV_VAR: &str = "GROK_HOME";
 pub(crate) const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
+/// DeepSeek Harness keeps every profile, session and user patch layer under one
+/// root; `$DSH_HOME` overrides it, exactly as `resolveDshHome` does.
+pub(crate) const DSH_HOME_ENV_VAR: &str = "DSH_HOME";
 
 pub(crate) fn apply_pane_base_env(cmd: &mut CommandBuilder) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
@@ -129,6 +132,10 @@ pub(crate) fn opencode_dir() -> io::Result<PathBuf> {
 
 pub(crate) fn kilo_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".config/kilo"))
+}
+
+pub(crate) fn dsh_dir() -> io::Result<PathBuf> {
+    config_dir_from_env_or_home(DSH_HOME_ENV_VAR, &[".dsh"])
 }
 
 pub(crate) fn hermes_dir() -> io::Result<PathBuf> {

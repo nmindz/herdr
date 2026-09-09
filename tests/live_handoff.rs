@@ -985,7 +985,9 @@ fn live_handoff_preserves_pane_process_io() {
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
     ));
-    drop(spawned);
+    // The old server broadcasts the shutdown as it exits, after the handoff
+    // response is written, so it has to be read before the guard kills that
+    // process. Dropping first raced the broadcast and truncated it mid-frame.
     assert!(
         wait_for_message_variant(
             &mut client_stream,
@@ -995,6 +997,7 @@ fn live_handoff_preserves_pane_process_io() {
         .unwrap(),
         "connected client shell should receive live-handoff shutdown"
     );
+    drop(spawned);
     thread::sleep(Duration::from_millis(300));
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));

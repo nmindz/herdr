@@ -19,10 +19,13 @@ use super::config_edit::{
     remove_direct_hook_commands, remove_flat_command_hook, remove_hermes_plugin_enabled,
     remove_hook_commands, remove_kimi_config_block, remove_simple_command_hook,
 };
+use super::dsh_patch::{
+    build_patch_with_plugin, build_patch_without_plugin, patch_is_only_herdr_block,
+};
 use super::env::{
     antigravity_cli_dir, claude_dir, codex_dir, copilot_dir, cursor_dir, devin_dir, droid_dir,
-    grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir, mastracode_dir, omp_extension_dir,
-    opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir,
+    dsh_dir, grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir, mastracode_dir,
+    omp_extension_dir, opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir,
 };
 use super::file_ops::{
     make_executable, remove_dir_all_if_exists, remove_file_if_exists, remove_legacy_bash_hook_file,
@@ -34,12 +37,12 @@ use super::types::{
     AntigravityCliInstallPaths, AntigravityCliUninstallResult, ClaudeInstallPaths,
     ClaudeUninstallResult, CodexInstallPaths, CodexUninstallResult, CopilotInstallPaths,
     CopilotUninstallResult, CursorInstallPaths, CursorUninstallResult, DevinInstallPaths,
-    DevinUninstallResult, DroidInstallPaths, DroidUninstallResult, GrokInstallPaths,
-    GrokUninstallResult, HermesInstallPaths, HermesUninstallResult, KiloInstallPaths,
-    KiloUninstallResult, KimiInstallPaths, KimiUninstallResult, MastracodeInstallPaths,
-    MastracodeUninstallResult, OmpInstallPaths, OmpUninstallResult, OpenCodeInstallPaths,
-    OpenCodeUninstallResult, PiUninstallResult, QodercliInstallPaths, QodercliUninstallResult,
-    QwenInstallPaths, QwenUninstallResult,
+    DevinUninstallResult, DroidInstallPaths, DroidUninstallResult, DshInstallPaths,
+    DshUninstallResult, GrokInstallPaths, GrokUninstallResult, HermesInstallPaths,
+    HermesUninstallResult, KiloInstallPaths, KiloUninstallResult, KimiInstallPaths,
+    KimiUninstallResult, MastracodeInstallPaths, MastracodeUninstallResult, OmpInstallPaths,
+    OmpUninstallResult, OpenCodeInstallPaths, OpenCodeUninstallResult, PiUninstallResult,
+    QodercliInstallPaths, QodercliUninstallResult, QwenInstallPaths, QwenUninstallResult,
 };
 use super::{
     ANTIGRAVITY_CLI_HOOK_ASSET, ANTIGRAVITY_CLI_HOOK_BLOCK_NAME, ANTIGRAVITY_CLI_HOOK_EVENTS,
@@ -49,7 +52,8 @@ use super::{
     CURSOR_HOOK_ASSET, CURSOR_HOOK_INSTALL_NAME, DEVIN_HOOK_ASSET, DEVIN_HOOK_EVENTS,
     DEVIN_HOOK_INSTALL_NAME, DEVIN_REMOVED_LIFECYCLE_HOOK_EVENTS, DROID_HOOK_ASSET,
     DROID_HOOK_EVENTS, DROID_HOOK_INSTALL_NAME, DROID_REMOVED_LIFECYCLE_HOOK_EVENTS,
-    GROK_HOOK_ASSET, GROK_HOOK_CONFIG_INSTALL_NAME, GROK_HOOK_INSTALL_NAME,
+    DSH_PATCH_INSTALL_NAME, DSH_PLUGIN_ASSET, DSH_PLUGIN_ENTRY_ID, DSH_PLUGIN_INSTALL_NAME,
+    DSH_PLUGIN_SPEC, GROK_HOOK_ASSET, GROK_HOOK_CONFIG_INSTALL_NAME, GROK_HOOK_INSTALL_NAME,
     HERMES_PLUGIN_INIT_ASSET, HERMES_PLUGIN_INIT_INSTALL_NAME, HERMES_PLUGIN_MANIFEST_ASSET,
     HERMES_PLUGIN_MANIFEST_INSTALL_NAME, KILO_PLUGIN_ASSET, KILO_PLUGIN_INSTALL_NAME,
     KIMI_HOOK_ASSET, KIMI_HOOK_INSTALL_NAME, MASTRACODE_HOOK_ASSET, MASTRACODE_HOOK_EVENTS,
@@ -494,6 +498,44 @@ pub(crate) fn install_kilo() -> io::Result<KiloInstallPaths> {
     Ok(KiloInstallPaths { plugin_path })
 }
 
+/// Install the plugin beside the home patch layer and register it there.
+///
+/// The plugin lands first: a patch entry naming a file that does not exist is
+/// a fatal DSH boot error, so the file must never be reachable before it is
+/// readable. The asset imports only Node builtins, which is what lets it live
+/// outside `profiles/` — bare `@deepseek-ai/*` specifiers only resolve for
+/// files under that tree.
+pub(crate) fn install_dsh() -> io::Result<DshInstallPaths> {
+    let dir = dsh_dir()?;
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "dsh home not found at {}. install deepseek harness first",
+            dir.display()
+        )));
+    }
+
+    let plugin_path = dir.join(DSH_PLUGIN_INSTALL_NAME);
+    fs::write(&plugin_path, DSH_PLUGIN_ASSET)?;
+
+    let patch_path = dir.join(DSH_PATCH_INSTALL_NAME);
+    let existing_patch = if patch_path.is_file() {
+        fs::read_to_string(&patch_path)?
+    } else {
+        String::new()
+    };
+    let new_patch = build_patch_with_plugin(&existing_patch, DSH_PLUGIN_ENTRY_ID, DSH_PLUGIN_SPEC);
+    let updated_patch = new_patch != existing_patch;
+    if updated_patch {
+        fs::write(&patch_path, new_patch)?;
+    }
+
+    Ok(DshInstallPaths {
+        plugin_path,
+        patch_path,
+        updated_patch,
+    })
+}
+
 pub(crate) fn install_hermes() -> io::Result<HermesInstallPaths> {
     let dir = hermes_dir()?;
     if !dir.is_dir() {
@@ -858,6 +900,38 @@ pub(crate) fn uninstall_kilo() -> io::Result<KiloUninstallResult> {
     Ok(KiloUninstallResult {
         plugin_path,
         removed_plugin,
+    })
+}
+
+/// Deregister before deleting: a patch entry that outlives its plugin file
+/// aborts every DSH boot, so the entry goes first and the file second.
+pub(crate) fn uninstall_dsh() -> io::Result<DshUninstallResult> {
+    let dir = dsh_dir()?;
+    let plugin_path = dir.join(DSH_PLUGIN_INSTALL_NAME);
+    let patch_path = dir.join(DSH_PATCH_INSTALL_NAME);
+
+    let mut updated_patch = false;
+    let mut removed_patch_file = false;
+    if patch_path.is_file() {
+        let existing_patch = fs::read_to_string(&patch_path)?;
+        // A file holding nothing but the herdr block is herdr's own; removing
+        // it leaves DSH with no home layer at all, which it treats as absent.
+        if patch_is_only_herdr_block(&existing_patch) {
+            removed_patch_file = remove_file_if_exists(&patch_path)?;
+        } else if let Some(new_patch) = build_patch_without_plugin(&existing_patch) {
+            fs::write(&patch_path, new_patch)?;
+            updated_patch = true;
+        }
+    }
+
+    let removed_plugin = remove_file_if_exists(&plugin_path)?;
+
+    Ok(DshUninstallResult {
+        plugin_path,
+        patch_path,
+        removed_plugin,
+        updated_patch,
+        removed_patch_file,
     })
 }
 

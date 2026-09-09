@@ -31,7 +31,6 @@ mod kitty_keyboard;
 mod osc;
 mod state;
 mod terminal;
-mod xtgettcap;
 
 use self::agent_detection::{
     decide_detection_screen_read, decide_screen_detection_publish,
