@@ -3353,6 +3353,7 @@ fn bundled_integration_asset_versions_match_expected_versions() {
             MASTRACODE_INTEGRATION_VERSION,
         ),
         ("grok", GROK_HOOK_ASSET, GROK_INTEGRATION_VERSION),
+        ("dsh", DSH_PLUGIN_ASSET, DSH_INTEGRATION_VERSION),
     ] {
         assert_eq!(
             parse_integration_version(asset),
