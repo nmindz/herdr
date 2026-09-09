@@ -494,13 +494,14 @@ export function apply(ctx) {
 
 /**
  * Title, usage and context live in session projections rather than on the
- * agent, so they are readable before the first agent exists. The service is
- * optional and read defensively: a profile that never loads it must not take
- * the rollup down with it.
+ * agent, so they are readable before the first agent exists. `ctx.get` reads
+ * the service without declaring it in `inject`, which would otherwise throw on
+ * every read and leave the row with nothing but the rollup; a profile that
+ * never loads the service simply publishes no usage tokens.
  */
 function sessionDisplay(ctx, session) {
   try {
-    const values = ctx.sessionProjections?.snapshot(session, PROJECTION_KEYS)?.values;
+    const values = ctx.get?.("sessionProjections")?.snapshot(session, PROJECTION_KEYS)?.values;
     if (values === undefined) return undefined;
     const next = {};
     const model = modelLabel(values.modelSelection?.next);

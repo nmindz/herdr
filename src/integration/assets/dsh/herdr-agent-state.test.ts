@@ -97,25 +97,36 @@ function fakeContext(
 ) {
   const handlers = new Map<string, (...args: unknown[]) => void>();
   const disposers: Array<() => Promise<void>> = [];
+  const services: Record<string, unknown> = {};
+  if (options.projections !== undefined) {
+    services.sessionProjections = { snapshot: () => ({ values: options.projections }) };
+  }
+
+  const ctx = {
+    logger: (_tag: string) => ({ warn() {} }),
+    effect(factory: () => () => Promise<void>, _label: string) {
+      disposers.push(factory());
+    },
+    on(event: string, handler: (...args: unknown[]) => void) {
+      handlers.set(event, handler);
+    },
+    agents: {
+      list: () => options.agents ?? [],
+      roots: () => options.roots ?? [],
+    },
+    get: (service: string) => services[service],
+  };
+
+  // Cordis throws for a service the plugin never declared in `inject`, so the
+  // asset must reach every optional service through `ctx.get`.
+  Object.defineProperty(ctx, "sessionProjections", {
+    get() {
+      throw new Error('cannot get property "sessionProjections" without inject');
+    },
+  });
 
   return {
-    ctx: {
-      logger: (_tag: string) => ({ warn() {} }),
-      effect(factory: () => () => Promise<void>, _label: string) {
-        disposers.push(factory());
-      },
-      on(event: string, handler: (...args: unknown[]) => void) {
-        handlers.set(event, handler);
-      },
-      agents: {
-        list: () => options.agents ?? [],
-        roots: () => options.roots ?? [],
-      },
-      sessionProjections:
-        options.projections === undefined
-          ? undefined
-          : { snapshot: () => ({ values: options.projections }) },
-    },
+    ctx,
     emit(event: string, ...args: unknown[]) {
       handlers.get(event)?.(...args);
     },
