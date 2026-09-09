@@ -439,20 +439,42 @@ pub fn wait_for_message_variant(
     wait_for_message_variants(stream, timeout, &[variant])
 }
 
+/// Bound how long a message read blocks, tolerating a peer that already closed.
+///
+/// macOS rejects `SO_RCVTIMEO` with `EINVAL` once the peer end of a Unix stream
+/// socket is gone, which is the state a live handoff leaves behind by design.
+/// The timeout only keeps a read from blocking, and a peer-closed socket hands
+/// back its buffered frames and then EOF immediately, so proceeding without it
+/// still terminates. Non-blocking mode is not a substitute: frames are read
+/// with `read_exact`, so a partial read would desync the framing.
+///
+/// Returns whether the timeout is in force.
+fn bound_message_reads(stream: &UnixStream) -> Result<bool, String> {
+    match stream.set_read_timeout(Some(Duration::from_millis(200))) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(false),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 pub fn wait_for_message_variants(
     stream: &mut UnixStream,
     timeout: Duration,
     variants: &[u32],
 ) -> Result<bool, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|e| e.to_string())?;
+    let timed = bound_message_reads(stream)?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
             Ok((got, _)) if variants.contains(&got) => return Ok(true),
             Ok(_) => continue,
-            Err(_) => continue,
+            Err(_) => {
+                // A drained peer-closed socket fails instantly without the
+                // timeout, so pace the retries instead of spinning.
+                if !timed {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
         }
     }
     Ok(false)
@@ -462,9 +484,7 @@ pub fn wait_for_client_shell_bootstrap(
     stream: &mut UnixStream,
     timeout: Duration,
 ) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|e| e.to_string())?;
+    let timed = bound_message_reads(stream)?;
     let deadline = Instant::now() + timeout;
     let mut saw_snapshot = false;
     while Instant::now() < deadline {
@@ -479,7 +499,12 @@ pub fn wait_for_client_shell_bootstrap(
             Ok((SERVER_MESSAGE_PANE_SURFACE, _)) => {
                 return Err("client shell pane surface arrived before its snapshot".into());
             }
-            Ok(_) | Err(_) => {}
+            Ok(_) => {}
+            Err(_) => {
+                if !timed {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
         }
     }
     Err(format!(
