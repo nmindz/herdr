@@ -408,6 +408,38 @@ function modelLabel(selection) {
   return effort ? `${model} \u00b7 ${effort}` : model;
 }
 
+// A loopback route means a local proxy serves the model, which is what the
+// provider cell already reads for other agents; anything else names its host.
+function backendFromBaseUrl(raw) {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (value === "") return undefined;
+  let host;
+  let port;
+  try {
+    const url = new URL(value.includes("://") ? value : `https://${value}`);
+    host = url.hostname.toLowerCase();
+    port = url.port;
+  } catch {
+    return undefined;
+  }
+  if (!host) return undefined;
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") {
+    return port === "11434" ? "ollama" : "local";
+  }
+  const parts = host.split(".");
+  const label = parts.length >= 2 && ["api", "www", "inference"].includes(parts[0]) ? parts[1] : parts[0];
+  return label === "" ? undefined : label;
+}
+
+// The routed provider names the cell; its configured base URL refines it to the
+// backend actually serving the route.
+function providerLabel(ctx, selection) {
+  const provider = selection?.provider;
+  if (typeof provider !== "string" || provider === "") return undefined;
+  const profile = ctx.get?.("settings")?.get?.("llm-pi-ai")?.providers?.[provider];
+  return backendFromBaseUrl(profile?.baseURL) ?? provider;
+}
+
 export function apply(ctx) {
   const config = paneConfig();
   if (config === undefined) return;
@@ -504,8 +536,11 @@ function sessionDisplay(ctx, session) {
     const values = ctx.get?.("sessionProjections")?.snapshot(session, PROJECTION_KEYS)?.values;
     if (values === undefined) return undefined;
     const next = {};
-    const model = modelLabel(values.modelSelection?.next);
+    const selection = values.modelSelection?.next;
+    const model = modelLabel(selection);
     if (model !== undefined) next.model = model;
+    const provider = providerLabel(ctx, selection);
+    if (provider !== undefined) next.provider = provider;
     if (values.title) next.title = values.title;
     const limit = formatTokenTotal(values.tokenUsage);
     if (limit !== undefined) next.limit = limit;
@@ -513,7 +548,7 @@ function sessionDisplay(ctx, session) {
     if (context !== undefined) next.context = context;
     return next;
   } catch {
-    // A projection shape change must not break state reporting.
+    // A projection or settings shape change must not break state reporting.
     return undefined;
   }
 }
@@ -538,8 +573,12 @@ function displayTokens(snapshot, display) {
     tokens.limit = display.limit;
     tokens.dsh_limit = display.limit;
   }
-  // `provider` belongs to whichever plugin owns provider/auth text; the model
-  // stays on a DSH-private token so the two never overwrite each other.
+  // usagebar owns `provider` for the agents it supports and ignores dsh, so a
+  // DSH pane fills the cell itself; the model stays on a private token.
+  if (display.provider !== undefined) {
+    tokens.provider = display.provider;
+    tokens.dsh_provider = display.provider;
+  }
   if (display.model !== undefined) tokens.dsh_model = display.model;
   return tokens;
 }
