@@ -22,6 +22,16 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
+/// This build is compiled and installed from source, so nothing may replace the
+/// binary behind the user's back. Gates the background check and both
+/// `self_update` entry points: `herdr update` and `herdr channel set`.
+pub(crate) const SELF_UPDATE_DISABLED: bool = true;
+
+/// Keeps the `self-update is disabled` prefix `main.rs` matches on to print the
+/// reason without an `update failed:` banner.
+const SELF_UPDATE_DISABLED_REASON: &str =
+    "self-update is disabled in this build; rebuild from source and reinstall instead";
+
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
@@ -2107,6 +2117,10 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    if SELF_UPDATE_DISABLED {
+        return Err(SELF_UPDATE_DISABLED_REASON.into());
+    }
+
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2346,6 +2360,10 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
 /// Background update check: only surface availability and release notes.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    if SELF_UPDATE_DISABLED {
+        return;
+    }
+
     crate::logging::update_check_started();
     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
         let version = version.trim();
@@ -3014,6 +3032,38 @@ mod tests {
             parse_self_update_args(&["--unknown".to_string()]).unwrap_err(),
             "unknown update option: --unknown"
         );
+    }
+
+    /// `herdr update` and `herdr channel set` both reach the binary through
+    /// `self_update`, so refusing here is what keeps a source build installed.
+    /// The error is returned before any manifest fetch, so this never leaves
+    /// the process.
+    #[test]
+    fn self_update_refuses_to_replace_a_source_build() {
+        let err = self_update(SelfUpdateOptions::default())
+            .expect_err("self-update must refuse while disabled");
+        assert_eq!(err, SELF_UPDATE_DISABLED_REASON);
+        // main.rs matches this prefix to print the reason without an
+        // "update failed:" banner.
+        assert!(err.starts_with("self-update is disabled"));
+    }
+
+    /// The background check must not even report an update, so nothing can
+    /// offer to install one. Priming the fake-update version proves the guard
+    /// runs ahead of every other path in `auto_update`.
+    #[test]
+    fn auto_update_reports_nothing_while_self_update_is_disabled() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var(FAKE_UPDATE_VERSION_ENV, "99.99.99");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        auto_update(tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "disabled auto-update must not emit UpdateReady"
+        );
+
+        std::env::remove_var(FAKE_UPDATE_VERSION_ENV);
     }
 
     #[test]

@@ -171,6 +171,13 @@ fn background_update_check_enabled(background_updates: bool, check_enabled: bool
     auto_updates_enabled(background_updates) && check_enabled
 }
 
+/// The herdr binary check, unlike the agent-detection manifest check, is also
+/// gated on this build allowing self-update at all.
+fn background_version_check_enabled(background_updates: bool, check_enabled: bool) -> bool {
+    !crate::update::SELF_UPDATE_DISABLED
+        && background_update_check_enabled(background_updates, check_enabled)
+}
+
 fn load_plugin_registry(
     persist_plugin_registry: bool,
 ) -> crate::app::state::InstalledPluginRegistry {
@@ -538,8 +545,10 @@ impl App {
         // Background auto-update is disabled for non-persistent test apps
         // and in debug/test builds so local development never mutates the
         // running binary out from under spawned test processes.
-        let version_check_enabled =
-            background_update_check_enabled(policy.background_updates, config.update.version_check);
+        let version_check_enabled = background_version_check_enabled(
+            policy.background_updates,
+            config.update.version_check,
+        );
         let manifest_check_enabled = background_update_check_enabled(
             policy.background_updates,
             config.update.manifest_check,
@@ -913,7 +922,7 @@ impl App {
             if !self.update_version_check_enabled {
                 self.next_auto_update_check = None;
             } else if !previous_version_check_enabled
-                && background_update_check_enabled(
+                && background_version_check_enabled(
                     self.policy.background_updates,
                     self.update_version_check_enabled,
                 )
