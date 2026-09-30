@@ -215,6 +215,14 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         ChannelSetInstallAction::RunSelfUpdate => {}
     }
 
+    // Changing the channel normally installs straight away. A source build has
+    // nothing to install from, and the channel is already written, so report
+    // that instead of failing on a refused self-update.
+    if crate::update::SELF_UPDATE_DISABLED {
+        println!("Rebuild from source and reinstall to pick up the {channel} channel.");
+        return Ok(0);
+    }
+
     crate::platform::end_cli_output();
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
